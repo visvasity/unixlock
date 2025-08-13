@@ -1,75 +1,107 @@
 // Copyright (c) 2025 Visvasity LLC
 
-// Package unixlock implements inter-process mutual exclusion using unix domain
-// sockets in a given directory. With unix domain sockets, losing processes can
-// communicate with the winner to signal for shutdown or other operations as well.
-
+// Package unixlock provides inter-process mutual exclusion using Unix domain sockets.
+// It creates a cooperative mutex at a specified file path, allowing processes to:
+//
+//   - Acquire and release locks.
+//   - Communicate with the lock owner to request graceful shutdown.
+//   - Query the owner's process ID (PID).
+//   - Verify if the owner is an ancestor process.
+//
+// The mutex supports non-blocking and blocking lock acquisition, context-aware
+// cancellation, and status reporting between processes.
 package unixlock
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// ErrShutdown indicates context is canceled due to an incoming shutdown message.
+// ErrShutdown indicates the context was canceled due to a shutdown request.
 var ErrShutdown = errors.New("shutdown")
 
-// ErrUnlocked indicates context is canceled due to the mutex unlock.
+// ErrUnlocked indicates the context was canceled because the lock was closed.
 var ErrUnlocked = errors.New("unlocked")
 
-type Lock struct {
+type Mutex struct {
+	mu sync.Mutex
+
 	wg sync.WaitGroup
 
-	listener net.Listener
+	listener atomic.Pointer[net.UnixListener]
 
 	derivedCancels []context.CancelCauseFunc
 
 	fpath string
+
+	pidMap map[int]bool
+
+	reportCh chan string
+
+	reported bool
 }
 
-// New creates a mutual exclusion lock instance using an unix domain socket at
-// the input path.
-func New(fpath string) *Lock {
-	return &Lock{fpath: fpath}
+// New creates a cooperative mutual exclusion lock instance using a Unix domain
+// socket at the specified file path. The mutex supports inter-process
+// communication for shutdown requests, PID queries, and ancestor checks.
+func New(fpath string) *Mutex {
+	m := &Mutex{
+		fpath:    fpath,
+		pidMap:   make(map[int]bool),
+		reportCh: make(chan string, 1),
+	}
+	m.pidMap[os.Getpid()] = true
+	return m
 }
 
-// Close destroys the lock. It will release the lock if it was acquired by this
-// process.
-func (v *Lock) Close() {
-	v.stopServer(os.ErrClosed)
-	v.wg.Wait()
+// Close releases the lock if held by the current process and cancels all derived
+// contexts with os.ErrClosed. It waits for all associated goroutines to terminate.
+func (m *Mutex) Close() {
+	m.stopServer(os.ErrClosed)
+	m.wg.Wait()
 }
 
-func (v *Lock) startServer(ctx context.Context) (string, error) {
-	dir := filepath.Dir(v.fpath)
-	base := filepath.Base(v.fpath)
+func (m *Mutex) startServer(ctx context.Context) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.listener.Load() != nil {
+		return "", os.ErrExist
+	}
+
+	dir := filepath.Dir(m.fpath)
+	base := filepath.Base(m.fpath)
 	pid := os.Getpid()
 
 	tpath := filepath.Join(dir, fmt.Sprintf("%s.%d", base, pid))
 	_ = os.Remove(tpath) // Remove stale file with matching pid (very unlikely)
 
-	l, err := net.Listen("unix", tpath)
+	addr := &net.UnixAddr{Name: tpath, Net: "unix"}
+	l, err := net.ListenUnix("unix", addr)
 	if err != nil {
 		return "", err
 	}
 
-	v.listener = l
+	m.listener.Store(l)
 
-	v.wg.Add(1)
+	m.wg.Add(1)
 	go func() {
-		defer v.wg.Done()
+		defer m.wg.Done()
 
-		for {
-			conn, err := v.listener.Accept()
+		for l := m.listener.Load(); l != nil; l = m.listener.Load() {
+			conn, err := l.Accept()
 			if err != nil {
 				if !errors.Is(err, net.ErrClosed) {
 					slog.Error("could not accept incoming connection (ignored)", "err", err)
@@ -77,53 +109,91 @@ func (v *Lock) startServer(ctx context.Context) (string, error) {
 				}
 				return
 			}
-			v.handle(conn)
+			m.handle(conn)
 		}
 	}()
 
 	return tpath, nil
 }
 
-func (v *Lock) stopServer(err error) {
-	if v.listener != nil {
-		v.listener.Close()
-		v.listener = nil
-		for _, cancel := range v.derivedCancels {
+func (m *Mutex) stopServer(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if l := m.listener.Load(); l != nil {
+		l.Close()
+		m.listener.Store(nil)
+		for _, cancel := range m.derivedCancels {
 			cancel(err)
 		}
-		v.derivedCancels = nil
+		m.derivedCancels = nil
 	}
 }
 
-func (v *Lock) handle(conn net.Conn) error {
+func (m *Mutex) handle(conn net.Conn) {
 	defer conn.Close()
 
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return err
+		slog.Warn("could not read from incoming connection", "err", err)
+		return
 	}
-	buf = buf[:n]
+	request := string(buf[:n])
+	args := strings.Fields(request)
+	cmd := args[0]
 
-	switch cmd := string(buf); cmd {
+	switch cmd {
 	case "getpid":
 		fmt.Fprintf(conn, "%d", os.Getpid())
-		return nil
+		return
 
 	case "shutdown":
-		v.stopServer(ErrShutdown)
-		fmt.Fprintf(conn, "ok")
-		return nil
+		slog.Info("canceling derived contexts due to shutdown message", "socket", m.fpath)
+		for _, cancel := range m.derivedCancels {
+			cancel(ErrShutdown)
+		}
+		return
+
+	case "report":
+		m.reportCh <- strings.TrimSpace(request[6:])
+		return
+
+	case "check-ancestor":
+		if len(args) != 3 {
+			fmt.Fprintf(conn, "os.ErrInvalid")
+			return
+		}
+		ppid, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			fmt.Fprintf(conn, "os.ErrInvalid")
+			return
+		}
+		pid, err := strconv.ParseInt(args[2], 10, 64)
+		if err != nil {
+			fmt.Fprintf(conn, "os.ErrInvalid")
+			return
+		}
+		// pidMap requires no lock because it is only accessed by the command
+		// handler and it handles one socket at a time, sequentially.
+		if m.pidMap[int(ppid)] || m.pidMap[int(pid)] {
+			m.pidMap[int(ppid)] = true
+			m.pidMap[int(pid)] = true
+			return
+		}
+		fmt.Fprintf(conn, "os.ErrNotExist")
+		return
 
 	default:
-		fmt.Fprintf(conn, "error: os.ErrInvalid")
-		return os.ErrInvalid
+		fmt.Fprintf(conn, "os.ErrInvalid")
+		slog.Warn("invalid/unrecognized input command", "cmd", cmd, "args", args)
+		return
 	}
 }
 
-func (v *Lock) sendCmd(ctx context.Context, cmd string) (string, error) {
+func (m *Mutex) sendCmd(ctx context.Context, cmd string) (string, error) {
 	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", v.fpath)
+	conn, err := d.DialContext(ctx, "unix", m.fpath)
 	if err != nil {
 		return "", err
 	}
@@ -134,16 +204,18 @@ func (v *Lock) sendCmd(ctx context.Context, cmd string) (string, error) {
 	}
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
-	if err != nil {
-		return "", err
-	}
 	buf = buf[:n]
+	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			return "", err
+		}
+	}
 	return string(buf), nil
 }
 
-// Owner returns the pid of the current owner.
-func (v *Lock) Owner(ctx context.Context) (int, error) {
-	response, err := v.sendCmd(ctx, "getpid")
+// Owner returns the PID of the process currently holding the lock.
+func (m *Mutex) Owner(ctx context.Context) (int, error) {
+	response, err := m.sendCmd(ctx, "getpid")
 	if err != nil {
 		return -1, err
 	}
@@ -154,61 +226,82 @@ func (v *Lock) Owner(ctx context.Context) (int, error) {
 	return int(pid), nil
 }
 
-// Shutdown sends shutdown message to the current owner.
-func (v *Lock) Shutdown(ctx context.Context) error {
-	if _, err := v.sendCmd(ctx, "shutdown"); err != nil {
+// shutdown sends a shutdown request to the lock owner.
+func (m *Mutex) shutdown(ctx context.Context) error {
+	response, err := m.sendCmd(ctx, "shutdown")
+	if err != nil {
 		return err
+	}
+	if len(response) != 0 {
+		return errors.New(response)
 	}
 	return nil
 }
 
-// TryAcquire attempts to acquire the lock without waiting. Returns the unlock
-// function and nil error on success. Returns os.ErrInvalid if the lock is
-// already held by the current process.
-func (v *Lock) TryAcquire(ctx context.Context) (closef func(), status error) {
-	if pid, err := v.Owner(ctx); err == nil {
+// CheckAncestor verifies if the lock owner is a parent or ancestor of the current
+// process. It returns nil if the check passes, otherwise an error. The lock owner
+// tracks PIDs of processes that pass this check to support deeply nested descendants.
+func (m *Mutex) CheckAncestor(ctx context.Context) error {
+	pid := os.Getpid()
+	ppid := os.Getppid()
+	cmd := fmt.Sprintf("check-ancestor %d %d", ppid, pid)
+	response, err := m.sendCmd(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	if len(response) != 0 {
+		return errors.New(response)
+	}
+	return nil
+}
+
+// TryLock attempts to acquire the lock without waiting. It returns an unlock
+// function and nil error on success. It returns os.ErrInvalid if the lock is
+// held by the current process, or another error if acquisition fails.
+func (m *Mutex) TryLock(ctx context.Context) (unlockf func(), status error) {
+	if pid, err := m.Owner(ctx); err == nil {
 		if pid == os.Getpid() {
 			return nil, os.ErrInvalid
 		}
-		return nil, err
+		return nil, fmt.Errorf("locked by another process")
 	}
 
-	tmpPath, err := v.startServer(ctx)
+	tmpPath, err := m.startServer(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if status != nil {
-			v.stopServer(os.ErrClosed)
+			m.stopServer(os.ErrClosed)
 		}
 	}()
 
-	os.Rename(tmpPath, v.fpath)
+	os.Rename(tmpPath, m.fpath)
 
-	pid, err := v.Owner(ctx)
+	pid, err := m.Owner(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if pid != os.Getpid() {
-		return nil, fmt.Errorf("locked by another")
+		return nil, fmt.Errorf("lock won by another process")
 	}
-	return func() { v.stopServer(ErrUnlocked) }, nil
+	return func() { m.stopServer(ErrUnlocked) }, nil
 }
 
-// Acquire acquires the lock by waiting until the lock is available or the
-// context expires. If force is true, then sends shutdown message once and then
-// waits for lock. Returns the unlock function and nil on success.
-func (v *Lock) Acquire(ctx context.Context, force bool) (func(), error) {
-	if closef, err := v.TryAcquire(ctx); err == nil {
+// Lock acquires the lock, waiting until it is available or the context expires.
+// If shutdown is true, it sends a shutdown request to the owner before waiting.
+// It returns an unlock function and nil on success, or an error on failure.
+func (m *Mutex) Lock(ctx context.Context, shutdown bool) (unlockf func(), status error) {
+	if closef, err := m.TryLock(ctx); err == nil {
 		return closef, nil
 	}
-	if force {
-		if err := v.Shutdown(ctx); err != nil {
+	if shutdown {
+		if err := m.shutdown(ctx); err != nil {
 			return nil, err
 		}
 	}
 	for ctx.Err() == nil {
-		if closef, err := v.TryAcquire(ctx); err == nil {
+		if closef, err := m.TryLock(ctx); err == nil {
 			return closef, nil
 		}
 		timeout := 50*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond
@@ -221,11 +314,13 @@ func (v *Lock) Acquire(ctx context.Context, force bool) (func(), error) {
 	return nil, context.Cause(ctx)
 }
 
-// WithLock returns a context that is canceled when the mutex is unlocked
-// (ErrUnlocked) or receives a shutdown request (ErrShutdown). Returns
-// os.ErrInvalid if the mutex is not locked.
-func WithLock(ctx context.Context, v *Lock) (context.Context, error) {
-	pid, err := v.Owner(ctx)
+// WithLock returns a context that is canceled when the input context is canceled,
+// the mutex is unlocked (ErrUnlocked), or a shutdown request is received
+// (ErrShutdown). It returns os.ErrInvalid if the mutex is not held by the
+// current process. The mutex is not automatically unlocked when the context is
+// canceled.
+func WithLock(ctx context.Context, m *Mutex) (context.Context, error) {
+	pid, err := m.Owner(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +329,40 @@ func WithLock(ctx context.Context, v *Lock) (context.Context, error) {
 	}
 
 	nctx, ncancel := context.WithCancelCause(ctx)
-	v.derivedCancels = append(v.derivedCancels, ncancel)
-
+	m.derivedCancels = append(m.derivedCancels, ncancel)
 	return nctx, nil
+}
+
+// WaitForReport blocks until a status report is received via the Unix domain
+// socket or the context is canceled. It is used by parent processes to wait for
+// initialization status from a child process.
+func WaitForReport(ctx context.Context, m *Mutex) error {
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case report := <-m.reportCh:
+		if len(report) == 0 {
+			return nil
+		}
+		return errors.New(report)
+	}
+}
+
+// Report sends a status message to the lock owner. A nil status indicates success.
+// Only one report can be sent per mutex; subsequent calls are no-ops. It returns
+// an error if the report cannot be sent.
+func Report(ctx context.Context, m *Mutex, status error) error {
+	if m.reported {
+		return nil
+	}
+	cmd := "report"
+	if status != nil {
+		cmd = fmt.Sprintf("report %v", status)
+	}
+	if _, err := m.sendCmd(ctx, cmd); err != nil {
+		slog.Error("could not send status report", "status", status, "err", err)
+		return err
+	}
+	m.reported = true
+	return nil
 }

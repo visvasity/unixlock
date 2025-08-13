@@ -18,18 +18,18 @@ func TestBasicLocking(t *testing.T) {
 	lock := New(lockPath)
 
 	// Try to acquire the lock
-	closef, err := lock.TryAcquire(ctx)
+	closef, err := lock.TryLock(ctx)
 	if err != nil {
-		t.Fatalf("first TryAcquire failed: %v", err)
+		t.Fatalf("first TryLock failed: %v", err)
 	}
 	if closef == nil {
-		t.Fatal("first TryAcquire returned nil close function")
+		t.Fatal("first TryLock returned nil close function")
 	}
 
 	// Second lock in same process should fail
 	lock2 := New(lockPath)
-	if _, err := lock2.TryAcquire(ctx); err == nil {
-		t.Fatal("expected second TryAcquire to fail, but it succeeded")
+	if _, err := lock2.TryLock(ctx); err == nil {
+		t.Fatal("expected second TryLock to fail, but it succeeded")
 	}
 
 	// Verify GetOwnerPid returns our PID
@@ -48,9 +48,9 @@ func TestBasicLocking(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Now second lock should succeed
-	closef2, err := lock2.TryAcquire(ctx)
+	closef2, err := lock2.TryLock(ctx)
 	if err != nil {
-		t.Fatalf("second TryAcquire after unlock failed: %v", err)
+		t.Fatalf("second TryLock after unlock failed: %v", err)
 	}
 	closef2()
 }
