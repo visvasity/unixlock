@@ -46,6 +46,8 @@ type Mutex struct {
 
 	fpath string
 
+	ppid int
+
 	pidMap map[int]bool
 
 	reportCh chan string
@@ -59,6 +61,7 @@ type Mutex struct {
 func New(fpath string) *Mutex {
 	m := &Mutex{
 		fpath:    fpath,
+		ppid:     os.Getppid(),
 		pidMap:   make(map[int]bool),
 		reportCh: make(chan string, 1),
 	}
@@ -156,7 +159,24 @@ func (m *Mutex) handle(conn net.Conn) {
 		return
 
 	case "report":
-		m.reportCh <- strings.TrimSpace(request[6:])
+		slog.Debug("received a report", "socket", m.fpath, "args", args)
+		if len(args) < 2 {
+			fmt.Fprintf(conn, "os.ErrInvalid")
+			return
+		}
+		report := ""
+		if len(args) > 2 {
+			report = strings.Join(args[2:], " ")
+		}
+		pid, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil || pid != int64(os.Getpid()) {
+			if err == nil {
+				slog.Warn("report message target is not the current lock owner", "report", report, "target", pid, "socket", m.fpath)
+			}
+			fmt.Fprintf(conn, "os.ErrInvalid")
+			return
+		}
+		m.reportCh <- report
 		return
 
 	case "check-ancestor":
@@ -243,8 +263,7 @@ func (m *Mutex) shutdown(ctx context.Context) error {
 // tracks PIDs of processes that pass this check to support deeply nested descendants.
 func (m *Mutex) CheckAncestor(ctx context.Context) error {
 	pid := os.Getpid()
-	ppid := os.Getppid()
-	cmd := fmt.Sprintf("check-ancestor %d %d", ppid, pid)
+	cmd := fmt.Sprintf("check-ancestor %d %d", m.ppid, pid)
 	response, err := m.sendCmd(ctx, cmd)
 	if err != nil {
 		return err
@@ -348,19 +367,22 @@ func WaitForReport(ctx context.Context, m *Mutex) error {
 	}
 }
 
-// Report sends a status message to the lock owner. A nil status indicates success.
-// Only one report can be sent per mutex; subsequent calls are no-ops. It returns
-// an error if the report cannot be sent.
+// Report sends a status message to the parent process if it is the current
+// lock owner. A nil status indicates success. Only one report can be sent per
+// mutex; subsequent calls are no-ops. It returns an error if the report cannot
+// be sent.
 func Report(ctx context.Context, m *Mutex, status error) error {
 	if m.reported {
 		return nil
 	}
-	cmd := "report"
+	cmd := fmt.Sprintf("report %d", m.ppid)
 	if status != nil {
-		cmd = fmt.Sprintf("report %v", status)
+		cmd = fmt.Sprintf("report %d %v", m.ppid, status)
 	}
 	if _, err := m.sendCmd(ctx, cmd); err != nil {
-		slog.Error("could not send status report", "status", status, "err", err)
+		if !strings.Contains(err.Error(), ": connection refused") {
+			slog.Warn("could not send status report", "status", status, "err", err, "socket", m.fpath)
+		}
 		return err
 	}
 	m.reported = true
