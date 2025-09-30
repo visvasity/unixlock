@@ -282,7 +282,7 @@ func (m *Mutex) TryLock(ctx context.Context) (unlockf func(), status error) {
 		if pid == os.Getpid() {
 			return nil, os.ErrInvalid
 		}
-		return nil, fmt.Errorf("locked by another process")
+		return nil, fmt.Errorf("locked by another process %d", pid)
 	}
 
 	tmpPath, err := m.startServer(ctx)
