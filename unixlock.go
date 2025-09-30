@@ -76,6 +76,11 @@ func (m *Mutex) Close() {
 	m.wg.Wait()
 }
 
+// SocketPath returns the monitor socket path.
+func (m *Mutex) SocketPath() string {
+	return m.fpath
+}
+
 func (m *Mutex) startServer(ctx context.Context) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
